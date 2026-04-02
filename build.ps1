@@ -1,17 +1,5 @@
-# Build frontends and start all services
+# Build all services and start
 Set-Location $PSScriptRoot
 
-Write-Host "Building frontend-classifier..." -ForegroundColor Cyan
-Set-Location frontend-classifier
-npm install
-npm run build
-Set-Location ..
-
-Write-Host "Building frontend-dash..." -ForegroundColor Cyan
-Set-Location frontend-dash
-npm install
-npm run build
-Set-Location ..
-
-Write-Host "Starting Docker Compose..." -ForegroundColor Cyan
+Write-Host "Building and starting all services..." -ForegroundColor Cyan
 docker compose up --build

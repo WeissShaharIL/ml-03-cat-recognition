@@ -6,8 +6,8 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - ./backend/model:/app/model
-      - ./backend/data:/app/data
+      - ./data:/app/data
+      - ./model:/app/model
     environment:
       - MODEL_PATH=/app/model/resnet18_cats.pth
       - DATA_DIR=/app/data

@@ -1,5 +1,6 @@
-backend/model/*.pth
-backend/data/
+model/*.pth
+data/cat/
+data/not_cat/
 node_modules/
 dist/
 __pycache__/
