@@ -1,0 +1,32 @@
+services:
+
+  backend:
+    build: ./backend
+    container_name: cat-backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend/model:/app/model
+      - ./backend/data:/app/data
+    environment:
+      - MODEL_PATH=/app/model/resnet18_cats.pth
+      - DATA_DIR=/app/data
+    restart: unless-stopped
+
+  frontend-classifier:
+    build: ./frontend-classifier
+    container_name: cat-classifier
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  frontend-dash:
+    build: ./frontend-dash
+    container_name: cat-dashboard
+    ports:
+      - "3001:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
