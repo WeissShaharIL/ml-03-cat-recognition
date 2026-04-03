@@ -1,0 +1,35 @@
+services:
+
+  backend:
+    build: ./backend
+    container_name: cat-backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./model:/app/model
+    environment:
+      - MODEL_DIR=/app/model
+      - DATA_DIR=/app/data
+      - CAT_DIR=/app/data/cat
+      - NOT_CAT_DIR=/app/data/not_cat
+      - RUNS_FILE=/app/data/runs.json
+    restart: unless-stopped
+
+  frontend-classifier:
+    build: ./frontend-classifier
+    container_name: cat-classifier
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  frontend-dash:
+    build: ./frontend-dash
+    container_name: cat-dashboard
+    ports:
+      - "3001:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
