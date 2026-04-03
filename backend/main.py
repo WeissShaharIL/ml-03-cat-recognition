@@ -1,7 +1,6 @@
 import os
 import json
 import time
-import re
 import threading
 from pathlib import Path
 from typing import Optional
@@ -12,11 +11,12 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-MODEL_PATH  = os.getenv("MODEL_PATH",  "/app/model/resnet18_cats.pth")
+MODEL_DIR   = os.getenv("MODEL_DIR",   "/app/model")
 DATA_DIR    = os.getenv("DATA_DIR",    "/app/data")
 CAT_DIR     = os.getenv("CAT_DIR",     "/app/data/cat")
 NOT_CAT_DIR = os.getenv("NOT_CAT_DIR", "/app/data/not_cat")
 RUNS_FILE   = os.getenv("RUNS_FILE",   "/app/data/runs.json")
+DEPLOYED_FILE = Path(MODEL_DIR) / "deployed.txt"   # contains filename of active model
 
 DEFAULT_EPOCHS     = int(os.getenv("DEFAULT_EPOCHS",     5))
 DEFAULT_BATCH_SIZE = int(os.getenv("DEFAULT_BATCH_SIZE", 32))
@@ -31,25 +31,30 @@ app.add_middleware(
 )
 
 # ── Global model state ─────────────────────────────────────────────────────────
-_model           = None
-_model_ready     = False
-_model_lock      = threading.Lock()
-_cancel_training = False
+_model            = None
+_model_ready      = False
+_model_lock       = threading.Lock()
+_cancel_training  = False
+_deployed_model   = None   # filename of currently deployed model (e.g. "model_1743612345.pth")
 
 # ── Startup ────────────────────────────────────────────────────────────────────
 @app.on_event("startup")
 def startup():
     Path(CAT_DIR).mkdir(parents=True, exist_ok=True)
     Path(NOT_CAT_DIR).mkdir(parents=True, exist_ok=True)
-    Path(MODEL_PATH).parent.mkdir(parents=True, exist_ok=True)
+    Path(MODEL_DIR).mkdir(parents=True, exist_ok=True)
     if not Path(RUNS_FILE).exists():
         Path(RUNS_FILE).write_text("[]")
 
-    if Path(MODEL_PATH).exists():
-        print(f"Model found at {MODEL_PATH}, loading...")
-        _load_model()
-    else:
-        print("No model found. Use the dashboard to fetch data and train.")
+    # Load deployed model if one exists
+    if DEPLOYED_FILE.exists():
+        deployed = DEPLOYED_FILE.read_text().strip()
+        model_path = Path(MODEL_DIR) / deployed
+        if model_path.exists():
+            print(f"Loading deployed model: {deployed}")
+            _load_model_from(str(model_path), deployed)
+            return
+    print("No deployed model found. Train and deploy via the dashboard.")
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 def count_images(directory: str) -> int:
@@ -72,43 +77,67 @@ def save_run(run: dict):
     Path(RUNS_FILE).write_text(json.dumps(runs, indent=2))
 
 
-def _load_model():
-    global _model, _model_ready
+def get_deployed_filename() -> Optional[str]:
+    if DEPLOYED_FILE.exists():
+        name = DEPLOYED_FILE.read_text().strip()
+        if (Path(MODEL_DIR) / name).exists():
+            return name
+    return None
+
+
+def list_model_files() -> list[dict]:
+    """Return all .pth files in MODEL_DIR with metadata from runs.json."""
+    runs = {str(r.get("model_file", "")): r for r in load_runs()}
+    deployed = get_deployed_filename()
+    models = []
+    for f in sorted(Path(MODEL_DIR).glob("model_*.pth"), reverse=True):
+        run = runs.get(f.name, {})
+        models.append({
+            "filename":      f.name,
+            "created_at":    run.get("created_at", ""),
+            "best_val_acc":  run.get("best_val_acc"),
+            "epochs":        run.get("epochs"),
+            "batch_size":    run.get("batch_size"),
+            "lr":            run.get("lr"),
+            "duration_seconds": run.get("duration_seconds"),
+            "dataset":       run.get("dataset", {}),
+            "deployed":      f.name == deployed,
+        })
+    return models
+
+
+def _load_model_from(path: str, filename: str):
+    global _model, _model_ready, _deployed_model
     try:
         import torch
         import torchvision.models as models
 
         model = models.resnet18(weights=None)
         model.fc = torch.nn.Linear(model.fc.in_features, 2)
-        model.load_state_dict(torch.load(MODEL_PATH, map_location="cpu"))
+        model.load_state_dict(torch.load(path, map_location="cpu"))
         model.eval()
 
         with _model_lock:
-            _model = model
-            _model_ready = True
-        print("Model loaded successfully.")
+            _model          = model
+            _model_ready    = True
+            _deployed_model = filename
+        print(f"Model loaded: {filename}")
     except Exception as e:
-        print(f"Failed to load model: {e}")
+        print(f"Failed to load model {filename}: {e}")
 
 
 def _preprocess_image(image_bytes: bytes):
-    """Resize, normalize, return tensor ready for inference."""
     from PIL import Image
     import torchvision.transforms as transforms
-    import torch
     import io
 
     transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225]
-        ),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
-
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    return transform(img).unsqueeze(0)  # add batch dim
+    return transform(img).unsqueeze(0)
 
 
 # ── Schemas ────────────────────────────────────────────────────────────────────
@@ -122,9 +151,9 @@ class TrainRequest(BaseModel):
 @app.get("/health")
 def health():
     return {
-        "status":       "ok",
-        "model_ready":  _model_ready,
-        "model_path":   MODEL_PATH,
+        "status":          "ok",
+        "model_ready":     _model_ready,
+        "deployed_model":  _deployed_model,
         "dataset": {
             "cat":     count_images(CAT_DIR),
             "not_cat": count_images(NOT_CAT_DIR),
@@ -135,7 +164,7 @@ def health():
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
     if not _model_ready:
-        raise HTTPException(status_code=503, detail="Model not loaded. Train first.")
+        raise HTTPException(status_code=503, detail="No model deployed. Train and deploy first.")
 
     import torch
     import torch.nn.functional as F
@@ -154,16 +183,13 @@ async def predict(file: UploadFile = File(...)):
     confidence   = max(cat_prob, not_cat_prob)
 
     return {
-        "prediction":   prediction,
-        "confidence":   round(confidence, 4),
+        "prediction":    prediction,
+        "confidence":    round(confidence, 4),
         "probabilities": {
             "cat":     round(cat_prob, 4),
             "not_cat": round(not_cat_prob, 4),
         }
     }
-
-
-
 
 
 @app.post("/train")
@@ -207,19 +233,17 @@ def train(req: TrainRequest):
         ])
 
         # ── Dataset ─────────────────────────────────────────────────────────────
-        # ImageFolder expects: DATA_DIR/cat/... and DATA_DIR/not_cat/...
         try:
             full_dataset = ImageFolder(root=DATA_DIR, transform=train_transform)
         except Exception as e:
             yield f"data: {json.dumps({'type': 'error', 'text': f'Failed to load dataset: {str(e)}'})}\n\n"
             return
 
-        # 80/20 train/val split
-        total     = len(full_dataset)
-        val_size  = max(1, int(total * 0.2))
+        total      = len(full_dataset)
+        val_size   = max(1, int(total * 0.2))
         train_size = total - val_size
         train_ds, val_ds = torch.utils.data.random_split(full_dataset, [train_size, val_size])
-        val_ds.dataset = ImageFolder(root=DATA_DIR, transform=val_transform)
+        val_ds.dataset   = ImageFolder(root=DATA_DIR, transform=val_transform)
 
         train_loader = DataLoader(train_ds, batch_size=req.batch_size, shuffle=True,  num_workers=0)
         val_loader   = DataLoader(val_ds,   batch_size=req.batch_size, shuffle=False, num_workers=0)
@@ -231,24 +255,24 @@ def train(req: TrainRequest):
         yield f"data: {json.dumps({'type': 'status', 'text': f'Using device: {str(device)}'})}\n\n"
 
         model = models.resnet18(weights="IMAGENET1K_V1")
-        # Freeze all layers except the final FC
         for param in model.parameters():
             param.requires_grad = False
-        model.fc = nn.Linear(model.fc.in_features, 2)  # 2 classes: cat, not_cat
-        model = model.to(device)
+        model.fc = nn.Linear(model.fc.in_features, 2)
+        model    = model.to(device)
 
         criterion = nn.CrossEntropyLoss()
         optimizer = torch.optim.Adam(model.fc.parameters(), lr=req.lr)
 
         # ── Training loop ────────────────────────────────────────────────────────
-        start_time  = time.time()
+        start_time   = time.time()
         best_val_acc = 0.0
         history      = []
+        model_file   = f"model_{int(start_time)}.pth"
+        model_path   = Path(MODEL_DIR) / model_file
 
         yield f"data: {json.dumps({'type': 'status', 'text': f'Starting training for {req.epochs} epochs...'})}\n\n"
 
         for epoch in range(req.epochs):
-            # Train
             model.train()
             train_loss, train_correct, train_total = 0.0, 0, 0
 
@@ -269,7 +293,6 @@ def train(req: TrainRequest):
                 train_total   += labels.size(0)
                 train_correct += predicted.eq(labels).sum().item()
 
-                # Progress within epoch
                 if (batch_idx + 1) % 5 == 0 or (batch_idx + 1) == len(train_loader):
                     yield f"data: {json.dumps({'type': 'batch', 'epoch': epoch+1, 'epochs': req.epochs, 'batch': batch_idx+1, 'batches': len(train_loader)})}\n\n"
 
@@ -293,18 +316,18 @@ def train(req: TrainRequest):
             val_acc  = val_correct / val_total
             val_loss = val_loss / len(val_loader)
 
-            # Save best model
+            # Save best weights for this run
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
-                torch.save(model.state_dict(), MODEL_PATH)
+                torch.save(model.state_dict(), str(model_path))
 
             epoch_data = {
-                "epoch":      epoch + 1,
-                "epochs":     req.epochs,
-                "train_loss": round(train_loss, 4),
-                "train_acc":  round(train_acc,  4),
-                "val_loss":   round(val_loss,   4),
-                "val_acc":    round(val_acc,    4),
+                "epoch":        epoch + 1,
+                "epochs":       req.epochs,
+                "train_loss":   round(train_loss, 4),
+                "train_acc":    round(train_acc,  4),
+                "val_loss":     round(val_loss,   4),
+                "val_acc":      round(val_acc,    4),
                 "best_val_acc": round(best_val_acc, 4),
             }
             history.append(epoch_data)
@@ -313,12 +336,13 @@ def train(req: TrainRequest):
         # ── Save run record ──────────────────────────────────────────────────────
         duration = int(time.time() - start_time)
         run = {
-            "id":           int(time.time()),
-            "created_at":   time.strftime("%Y-%m-%dT%H:%M:%S"),
-            "epochs":       req.epochs,
-            "batch_size":   req.batch_size,
-            "lr":           req.lr,
-            "best_val_acc": round(best_val_acc, 4),
+            "id":               int(start_time),
+            "model_file":       model_file,
+            "created_at":       time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "epochs":           req.epochs,
+            "batch_size":       req.batch_size,
+            "lr":               req.lr,
+            "best_val_acc":     round(best_val_acc, 4),
             "duration_seconds": duration,
             "dataset": {
                 "cat":     cat_count,
@@ -328,10 +352,7 @@ def train(req: TrainRequest):
         }
         save_run(run)
 
-        # Reload model into memory
-        _load_model()
-
-        yield f"data: {json.dumps({'type': 'done', 'best_val_acc': round(best_val_acc, 4), 'duration_seconds': duration})}\n\n"
+        yield f"data: {json.dumps({'type': 'done', 'model_file': model_file, 'best_val_acc': round(best_val_acc, 4), 'duration_seconds': duration})}\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 
@@ -348,26 +369,43 @@ def list_runs():
     return load_runs()
 
 
-@app.delete("/data/clear")
-def clear_data():
-    """Delete all images from cat and not_cat folders."""
-    import shutil
-    for d in [CAT_DIR, NOT_CAT_DIR]:
-        p = Path(d)
-        if p.exists():
-            shutil.rmtree(d)
-            p.mkdir(parents=True, exist_ok=True)
-    return {"status": "ok", "cat": 0, "not_cat": 0}
+@app.get("/models")
+def list_models():
+    """List all trained model files with metadata."""
+    return list_model_files()
+
+
+@app.post("/models/{filename}/deploy")
+def deploy_model(filename: str):
+    """Instantly swap the active model in memory."""
+    model_path = Path(MODEL_DIR) / filename
+    if not model_path.exists():
+        raise HTTPException(status_code=404, detail=f"Model file {filename} not found.")
+
+    # Write deployed.txt
+    DEPLOYED_FILE.write_text(filename)
+
+    # Load into memory instantly
+    _load_model_from(str(model_path), filename)
+
+    return {"status": "ok", "deployed": filename}
 
 
 @app.post("/reset")
 def reset_all():
-    """Wipe model weights and training history. Images are kept."""
-    if Path(MODEL_PATH).exists():
-        Path(MODEL_PATH).unlink()
+    """Wipe all model files, deployed pointer and training history. Images kept."""
+    import shutil
+    # Delete all model files
+    for f in Path(MODEL_DIR).glob("model_*.pth"):
+        f.unlink()
+    if DEPLOYED_FILE.exists():
+        DEPLOYED_FILE.unlink()
     Path(RUNS_FILE).write_text("[]")
-    global _model, _model_ready
+
+    global _model, _model_ready, _deployed_model
     with _model_lock:
-        _model       = None
-        _model_ready = False
+        _model          = None
+        _model_ready    = False
+        _deployed_model = None
+
     return {"status": "ok"}

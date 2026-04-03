@@ -9,8 +9,11 @@ services:
       - ./data:/app/data
       - ./model:/app/model
     environment:
-      - MODEL_PATH=/app/model/resnet18_cats.pth
+      - MODEL_DIR=/app/model
       - DATA_DIR=/app/data
+      - CAT_DIR=/app/data/cat
+      - NOT_CAT_DIR=/app/data/not_cat
+      - RUNS_FILE=/app/data/runs.json
     restart: unless-stopped
 
   frontend-classifier:
